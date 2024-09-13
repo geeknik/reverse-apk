@@ -11,6 +11,8 @@ import subprocess
 import re
 import urllib.parse
 from typing import Dict, List, Any, Set, Tuple
+import multiprocessing
+from functools import lru_cache
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,20 +31,19 @@ def extract_apk(apk_path: str) -> str:
 def decompile_apk(apk_path: str, output_dir: str) -> None:
     """Decompile APK using various tools"""
     logger.info("Decompiling APK...")
-    try:
-        subprocess.run(['apktool', 'd', apk_path, '-o', f"{output_dir}/apktool"], check=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"apktool failed: {e}")
     
-    try:
-        subprocess.run(['d2j-dex2jar', apk_path, '-o', f"{output_dir}/decompiled.jar"], check=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"dex2jar failed: {e}")
-    
-    try:
-        subprocess.run(['jadx', f"{output_dir}/decompiled.jar", '-d', f"{output_dir}/jadx"], check=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"jadx failed: {e}")
+    def run_tool(tool, args):
+        try:
+            subprocess.run([tool] + args, check=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"{tool} failed: {e}")
+
+    with multiprocessing.Pool() as pool:
+        pool.starmap(run_tool, [
+            ('apktool', ['d', apk_path, '-o', f"{output_dir}/apktool"]),
+            ('d2j-dex2jar', [apk_path, '-o', f"{output_dir}/decompiled.jar"]),
+            ('jadx', [f"{output_dir}/decompiled.jar", '-d', f"{output_dir}/jadx"])
+        ])
 
 def run_nuclei_scan(output_dir: str, target_dir: str, timeout_minutes: int) -> str:
     """Run nuclei scan on a specific directory with optimizations and error handling"""
@@ -120,38 +121,52 @@ def process_manifest(tree: ET.ElementTree) -> None:
                     "name": elem.get(f"{xmlns}name"),
                 })
 
-def extract_urls_and_endpoints(decompiled_dir: str) -> Tuple[Set[str], Set[str], Set[str]]:
-    """Extract URLs, JavaScript URLs, and potential API endpoints from decompiled files"""
+def extract_urls_and_endpoints(file_path: str) -> Tuple[Set[str], Set[str], Set[str]]:
+    """Extract URLs, JavaScript URLs, and potential API endpoints from a single file"""
     urls = set()
     js_urls = set()
     api_endpoints = set()
 
-    for root, _, files in os.walk(decompiled_dir):
-        for file in files:
-            if file.endswith(('.java', '.xml', '.smali')):
-                with open(os.path.join(root, file), 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
 
-                    # Extract URLs
-                    found_urls = re.findall(r'https?://[^\s/$.?#].[^\s]*', content)
-                    urls.update(found_urls)
+    # Extract URLs
+    found_urls = set(re.findall(r'https?://[^\s/$.?#].[^\s]*', content))
+    urls.update(found_urls)
 
-                    # Identify JavaScript URLs
-                    js_found = [url for url in found_urls if url.lower().endswith('.js')]
-                    js_urls.update(js_found)
+    # Identify JavaScript URLs
+    js_urls.update(url for url in found_urls if url.lower().endswith('.js'))
 
-                    # Extract potential API endpoints
-                    api_patterns = [
-                        r'/api/[a-zA-Z0-9-_/]+',
-                        r'/v\d+/[a-zA-Z0-9-_/]+',
-                        r'/rest/[a-zA-Z0-9-_/]+'
-                    ]
-                    for pattern in api_patterns:
-                        endpoints = re.findall(pattern, content)
-                        api_endpoints.update(endpoints)
+    # Extract potential API endpoints
+    api_patterns = '|'.join([r'/api/[a-zA-Z0-9-_/]+', r'/v\d+/[a-zA-Z0-9-_/]+', r'/rest/[a-zA-Z0-9-_/]+'])
+    api_endpoints.update(re.findall(api_patterns, content))
 
     return urls, js_urls, api_endpoints
 
+def process_files(decompiled_dir: str) -> Tuple[Set[str], Set[str], Set[str]]:
+    """Process all files in parallel"""
+    file_paths = [
+        os.path.join(root, file)
+        for root, _, files in os.walk(decompiled_dir)
+        for file in files
+        if file.endswith(('.java', '.xml', '.smali'))
+    ]
+
+    with multiprocessing.Pool() as pool:
+        results = pool.map(extract_urls_and_endpoints, file_paths)
+
+    urls = set()
+    js_urls = set()
+    api_endpoints = set()
+
+    for u, js, api in results:
+        urls.update(u)
+        js_urls.update(js)
+        api_endpoints.update(api)
+
+    return urls, js_urls, api_endpoints
+
+@lru_cache(maxsize=None)
 def analyze_apk(apk_path: str, timeout_minutes: int) -> Dict[str, Any]:
     """Analyze an APK file and return the results"""
     temp_dir = extract_apk(apk_path)
@@ -162,12 +177,13 @@ def analyze_apk(apk_path: str, timeout_minutes: int) -> Dict[str, Any]:
         decompile_apk(apk_path, output_dir)
         
         # Run separate nuclei scans
-        nuclei_outputs = []
-        for scan_dir in ['apktool', 'jadx/sources']:
-            target_dir = os.path.join(output_dir, scan_dir)
-            nuclei_output = run_nuclei_scan(output_dir, target_dir, timeout_minutes)
-            if nuclei_output:
-                nuclei_outputs.append(nuclei_output)
+        with multiprocessing.Pool() as pool:
+            scan_dirs = ['apktool', 'jadx/sources']
+            nuclei_outputs = pool.starmap(
+                run_nuclei_scan,
+                [(output_dir, os.path.join(output_dir, scan_dir), timeout_minutes) for scan_dir in scan_dirs]
+            )
+        nuclei_outputs = [output for output in nuclei_outputs if output]
 
         manifest_path = os.path.join(output_dir, "apktool", "AndroidManifest.xml")
         if os.path.isfile(manifest_path):
@@ -177,7 +193,7 @@ def analyze_apk(apk_path: str, timeout_minutes: int) -> Dict[str, Any]:
         if nuclei_outputs:
             analysis["nuclei_results"] = nuclei_outputs
 
-        urls, js_urls, api_endpoints = extract_urls_and_endpoints(output_dir)
+        urls, js_urls, api_endpoints = process_files(output_dir)
         analysis["urls"] = list(urls)
         analysis["js_urls"] = list(js_urls)
         analysis["api_endpoints"] = list(api_endpoints)
